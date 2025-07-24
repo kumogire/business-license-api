@@ -1,49 +1,70 @@
-from fastapi import FastAPI
-from app.api.routes import set_routes
-from pydantic import BaseModel
-from typing import List
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import logging
 
-app = FastAPI()
+from app.core.config import settings
+from app.core.cache import cache
+from app.api.routes import licenses
 
-class LicenseSchema(BaseModel):
-    license_number: str
-    license_type: str
-    status: str
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format=settings.LOG_FORMAT
+)
 
-class BusinessSchema(BaseModel):
-    dba_number: str
-    name: str
-    business_type: str
-    licenses: List[LicenseSchema]
+# Create FastAPI app
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description=settings.DESCRIPTION,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url=f"{settings.API_V1_STR}/docs",
+    redoc_url=f"{settings.API_V1_STR}/redoc",
+)
 
-set_routes(app)
+# Set up CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Include routers
+app.include_router(licenses.router, prefix=settings.API_V1_STR)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    await cache.init_redis()
+    logging.info("Application started successfully")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    await cache.close_redis()
+    logging.info("Application shutdown")
 
 @app.get("/")
-def read_root():
-    return {"message": "Welcome to the Business License API"}
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Business License API",
+        "version": settings.VERSION,
+        "docs": f"{settings.API_V1_STR}/docs"
+    }
 
-@app.get("/businesses", response_model=List[BusinessSchema])
-def get_businesses():
-    # Replace with actual DB query
-    return [
-        {"dba_number": "12345", "name": "Keith's Coffee", "business_type": "Retail", "licenses": []},
-        {"dba_number": "67890", "name": "Jane's Bakery", "business_type": "Food Service", "licenses": []}
-    ]
-'''
-# For when we have a seeded database
-from app.services.business_service import BusinessService
-from app.database import get_db
-from fastapi import Depends
-@router.get("/businesses")
-def read_businesses(db: Session = Depends(get_db)):
-    service = BusinessService(db)
-    return service.get_all_businesses()
-'''
-
-@app.get("/licenses", response_model=List[LicenseSchema])
-def get_licenses():
-    # Replace with actual DB query
-    return [
-        {"license_number": "ABC123", "license_type": "Retail", "status": "Active"},
-        {"license_number": "XYZ456", "license_type": "Food Service", "status": "Expired"}
-    ]
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "version": settings.VERSION}
